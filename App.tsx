@@ -118,7 +118,7 @@ function App() {
 
       // 1. Search Stations
       // We convert values to array to search
-      const foundStop = Array.from(gtfsData.stops.values()).find(s => 
+      const foundStop = Array.from(gtfsData.stops.values()).find((s: Stop) => 
           s.stop_name.toLowerCase().includes(term) || s.stop_id.toLowerCase() === term
       );
 
@@ -143,7 +143,7 @@ function App() {
 
       // If not live, check ALL trips (scheduled)
       // We need to construct a "Dummy" TrainPosition for viewing purposes
-      const foundTrip = Array.from(gtfsData.trips.values()).find(t => 
+      const foundTrip = Array.from(gtfsData.trips.values()).find((t: Trip) => 
           t.trip_short_name?.toLowerCase().includes(term) ||
           t.trip_headsign.toLowerCase().includes(term)
       );

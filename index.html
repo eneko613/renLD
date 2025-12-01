@@ -33,6 +33,7 @@
         background: #f1f5f9;
       }
     </style>
+  <!-- Keep importmap for local preview environments if needed, but Vite will use node_modules -->
   <script type="importmap">
 {
   "imports": {
@@ -44,12 +45,16 @@
     "react-leaflet": "https://aistudiocdn.com/react-leaflet@^5.0.0",
     "leaflet": "https://aistudiocdn.com/leaflet@^1.9.4",
     "leaflet/": "https://aistudiocdn.com/leaflet@^1.9.4/",
-    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0"
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0",
+    "vite": "https://aistudiocdn.com/vite@^7.2.6",
+    "@vitejs/plugin-react": "https://aistudiocdn.com/@vitejs/plugin-react@^5.1.1"
   }
 }
 </script>
 </head>
   <body class="bg-slate-50 text-slate-900 font-sans antialiased overflow-hidden">
     <div id="root"></div>
+    <!-- Add the entry point script for Vite/Browsers to actually load the app -->
+    <script type="module" src="/index.tsx"></script>
   </body>
 </html>
