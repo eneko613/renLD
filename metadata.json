@@ -1,0 +1,5 @@
+{
+  "name": "Renfe AV/LD Live Tracker",
+  "description": "Visualizes Renfe High-Speed (AV) and Long Distance (LD) trains in real-time using GTFS data. Upload the google_transit.zip to see live interpolated positions.",
+  "requestFramePermissions": []
+}
