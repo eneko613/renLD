@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileDown, Loader2, AlertTriangle, Train, CloudDownload } from 'lucide-react';
+import { Upload, Loader2, AlertTriangle, Train, Download } from 'lucide-react';
 import { parseGTFSZip, getActiveTripsForToday, fetchRemoteGTFS } from './services/gtfsParser';
 import { calculateTrainPositions, getCurrentSeconds } from './services/trainSimulator';
 import { TrainMap } from './components/TrainMap';
@@ -306,7 +306,7 @@ function App() {
                 onClick={handleFetchUrl}
                 className="flex flex-col items-center justify-center gap-3 p-6 rounded-xl bg-purple-600 text-white hover:bg-purple-700 transition-all shadow-lg hover:shadow-purple-500/25 group"
             >
-                <CloudDownload size={32} className="group-hover:scale-110 transition-transform" />
+                <Download size={32} className="group-hover:scale-110 transition-transform" />
                 <div className="text-left">
                     <span className="block font-bold text-lg">Auto Load Data</span>
                     <span className="text-purple-200 text-sm">Fetch directly from Renfe</span>
