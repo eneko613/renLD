@@ -1,179 +1,341 @@
-import JSZip from 'jszip';
-import Papa from 'papaparse';
-import { GTFSData, Stop, Route, Trip, StopTime, Calendar, ExtendedGTFSData, CalendarDate } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { Upload, Loader2, AlertTriangle, Train, Download } from 'lucide-react';
+import { parseGTFSZip, getActiveTripsForToday, fetchRemoteGTFS } from './services/gtfsParser';
+import { calculateTrainPositions, getCurrentSeconds } from './services/trainSimulator';
+import { TrainMap } from './components/TrainMap';
+import { Sidebar } from './components/Sidebar';
+import { GTFSData, TrainPosition, Trip, Stop } from './types';
 
-// Helper to parse HH:MM:SS to seconds from midnight
-export const timeToSeconds = (timeStr: string): number => {
-  if (!timeStr) return 0;
-  const parts = timeStr.split(':');
-  const h = parseInt(parts[0], 10);
-  const m = parseInt(parts[1], 10);
-  const s = parts[2] ? parseInt(parts[2], 10) : 0;
-  return h * 3600 + m * 60 + s;
-};
+// Constants
+const RENFE_GTFS_URL = "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip";
+const SIMULATION_TICK_MS = 1000;
 
-// Renforce CORS proxy URL
-const CORS_PROXY = "https://api.allorigins.win/raw?url=";
-
-export const fetchRemoteGTFS = async (url: string, onProgress: (msg: string) => void): Promise<ExtendedGTFSData> => {
-    onProgress("Downloading GTFS data (this may take a few seconds)...");
-    const proxiedUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-    
-    const response = await fetch(proxiedUrl);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch GTFS data: ${response.statusText}`);
-    }
-    const blob = await response.blob();
-    const file = new File([blob], "google_transit.zip");
-    return parseGTFSZip(file, onProgress);
-}
-
-export const parseGTFSZip = async (file: File, onProgress: (msg: string) => void): Promise<ExtendedGTFSData> => {
-  onProgress("Unzipping archive...");
-  const zip = await JSZip.loadAsync(file);
-
-  const readCSV = async <T>(filename: string): Promise<T[]> => {
-    // Some zips might have folders, so we search for the file
-    const fileMatch = Object.keys(zip.files).find(path => path.endsWith(filename));
-    
-    if (!fileMatch) {
-        console.warn(`${filename} not found in zip`);
-        return [];
-    }
-    const text = await zip.file(fileMatch)!.async('string');
-    return new Promise((resolve) => {
-      Papa.parse(text, {
-        header: true,
-        skipEmptyLines: true,
-        complete: (results) => resolve(results.data as T[]),
-      });
-    });
-  };
-
-  onProgress("Parsing Calendar...");
-  const calendarRaw = await readCSV<any>('calendar.txt');
-  const calendar = new Map<string, Calendar>();
-  calendarRaw.forEach(c => calendar.set(c.service_id, c));
-
-  onProgress("Parsing Calendar Dates (Exceptions)...");
-  const calendarDatesRaw = await readCSV<CalendarDate>('calendar_dates.txt');
-  const calendarDates = new Map<string, CalendarDate[]>();
-  calendarDatesRaw.forEach(cd => {
-      if (!calendarDates.has(cd.service_id)) {
-          calendarDates.set(cd.service_id, []);
-      }
-      calendarDates.get(cd.service_id)!.push(cd);
-  });
-
-  onProgress("Parsing Routes...");
-  const routesRaw = await readCSV<any>('routes.txt');
-  const routes = new Map<string, Route>();
-  routesRaw.forEach(r => routes.set(r.route_id, r));
-
-  onProgress("Parsing Stops...");
-  const stopsRaw = await readCSV<any>('stops.txt');
-  const stops = new Map<string, Stop>();
-  stopsRaw.forEach(s => {
-    stops.set(s.stop_id, {
-      ...s,
-      stop_lat: parseFloat(s.stop_lat),
-      stop_lon: parseFloat(s.stop_lon)
-    });
-  });
-
-  onProgress("Parsing Trips...");
-  const tripsRaw = await readCSV<any>('trips.txt');
-  const trips = new Map<string, Trip>();
-  tripsRaw.forEach(t => trips.set(t.trip_id, t));
-
-  onProgress("Parsing Stop Times (this may take a moment)...");
-  const stopTimesRaw = await readCSV<any>('stop_times.txt');
-  const stopTimes = new Map<string, StopTime[]>();
+function App() {
+  const [gtfsData, setGtfsData] = useState<GTFSData | null>(null);
+  const [activeTrips, setActiveTrips] = useState<string[]>([]);
+  const [positions, setPositions] = useState<TrainPosition[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [currentTimeStr, setCurrentTimeStr] = useState("00:00:00");
   
-  // Group stop_times by trip_id
-  stopTimesRaw.forEach(st => {
-    if (!trips.has(st.trip_id)) return; // Skip orphan stop times
-    
-    const processed: StopTime = {
-      ...st,
-      stop_sequence: parseInt(st.stop_sequence),
-      arrival_seconds: timeToSeconds(st.arrival_time),
-      departure_seconds: timeToSeconds(st.departure_time),
+  // Selection State
+  const [selectedTrain, setSelectedTrain] = useState<TrainPosition | null>(null);
+  const [selectedStation, setSelectedStation] = useState<Stop | null>(null);
+  
+  // Sidebar UI State
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const dragCounter = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Simulation Loop
+  useEffect(() => {
+    if (!gtfsData) return;
+
+    const tick = () => {
+      // Force Madrid time display
+      const now = new Date();
+      setCurrentTimeStr(now.toLocaleTimeString('es-ES', { timeZone: 'Europe/Madrid' }));
+
+      // If no active trips, don't simulate
+      if (activeTrips.length === 0) return;
+
+      const seconds = getCurrentSeconds();
+      const newPositions = calculateTrainPositions(gtfsData, activeTrips, seconds);
+      setPositions(newPositions);
+
+      // Update selected train object if it exists to keep position live
+      if (selectedTrain && (selectedTrain.status === 'MOVING' || selectedTrain.status === 'AT_STOP')) {
+          const updated = newPositions.find(p => p.trip_id === selectedTrain.trip_id);
+          // If train finished its route, it disappears from newPositions. Keep old one or update status?
+          if (updated) {
+              setSelectedTrain(updated);
+          } else {
+             // If it disappeared but we had it selected, it might have just finished.
+             // We can leave it as is, or mark as ENDED.
+          }
+      }
     };
 
-    if (!stopTimes.has(st.trip_id)) {
-      stopTimes.set(st.trip_id, []);
-    }
-    stopTimes.get(st.trip_id)!.push(processed);
-  });
+    // Initial tick
+    tick();
 
-  // Sort sequences
-  for (const [tripId, times] of stopTimes.entries()) {
-    times.sort((a, b) => a.stop_sequence - b.stop_sequence);
-  }
+    const interval = setInterval(tick, SIMULATION_TICK_MS);
+    return () => clearInterval(interval);
+  }, [gtfsData, activeTrips, selectedTrain]);
 
-  onProgress("Data ready!");
-  
-  return {
-    calendar,
-    calendarDates,
-    routes,
-    stops,
-    trips,
-    stopTimes
-  };
-};
-
-export const getActiveTripsForToday = (gtfs: ExtendedGTFSData, date: Date): string[] => {
-  const dayOfWeek = date.getDay(); // 0 = Sunday
-  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-  const todayStr = days[dayOfWeek];
-  
-  // Format date as YYYYMMDD
-  const yyyy = date.getFullYear().toString();
-  const mm = (date.getMonth() + 1).toString().padStart(2, '0');
-  const dd = date.getDate().toString().padStart(2, '0');
-  const dateInt = parseInt(`${yyyy}${mm}${dd}`);
-  const dateStr = `${yyyy}${mm}${dd}`;
-
-  const activeServiceIds = new Set<string>();
-
-  // 1. Check Standard Calendar
-  gtfs.calendar.forEach((cal) => {
-    const start = parseInt(cal.start_date);
-    const end = parseInt(cal.end_date);
+  // Process Data Helper
+  const processData = async (data: any) => {
+    setLoadingMsg("Calculating active services for today...");
+    await new Promise(r => setTimeout(r, 100)); // UI Yield
     
-    if (dateInt >= start && dateInt <= end) {
-      if ((cal as any)[todayStr] === '1') {
-        activeServiceIds.add(cal.service_id);
-      }
-    }
-  });
+    // Ensure we are checking against Madrid date
+    const now = new Date();
+    const madridDateStr = now.toLocaleDateString('en-US', { timeZone: 'Europe/Madrid' });
+    const madridDate = new Date(madridDateStr);
 
-  // 2. Check Exceptions (calendar_dates.txt)
-  if (gtfs.calendarDates) {
-      gtfs.calendarDates.forEach((dates, serviceId) => {
-          dates.forEach(d => {
-              if (d.date === dateStr) {
-                  if (d.exception_type === '1') {
-                      activeServiceIds.add(serviceId); // Add service
-                  } else if (d.exception_type === '2') {
-                      activeServiceIds.delete(serviceId); // Remove service
-                  }
-              }
-          });
-      });
+    const active = getActiveTripsForToday(data, madridDate);
+    
+    setGtfsData(data);
+    setActiveTrips(active);
+    setLoading(false);
+  };
+
+  // Handlers
+  const handleFetchUrl = async () => {
+      try {
+          setLoading(true);
+          setError(null);
+          const data = await fetchRemoteGTFS(RENFE_GTFS_URL, (msg) => setLoadingMsg(msg));
+          await processData(data);
+      } catch (e: any) {
+          console.error(e);
+          setError("Failed to download from Renfe. " + e.message);
+          setLoading(false);
+      }
+  };
+
+  const handleFile = async (file: File) => {
+    try {
+        setLoading(true);
+        setError(null);
+        const data = await parseGTFSZip(file, (msg) => setLoadingMsg(msg));
+        await processData(data);
+    } catch (e: any) {
+        console.error(e);
+        setError("Failed to parse GTFS file. Please ensure it is a valid zip containing required txt files.");
+        setLoading(false);
+    }
+  };
+
+  const handleSearch = (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!searchTerm.trim() || !gtfsData) return;
+
+      const term = searchTerm.toLowerCase();
+
+      // 1. Search Stations
+      // We convert values to array to search
+      const foundStop = Array.from(gtfsData.stops.values()).find((s: Stop) => 
+          s.stop_name.toLowerCase().includes(term) || s.stop_id.toLowerCase() === term
+      );
+
+      if (foundStop) {
+          setSelectedStation(foundStop);
+          setSelectedTrain(null);
+          return;
+      }
+
+      // 2. Search Trains (Active & Inactive)
+      // First check active positions (live trains)
+      const foundLive = positions.find(p => 
+          p.trip?.trip_short_name?.toLowerCase().includes(term) ||
+          p.trip?.trip_headsign.toLowerCase().includes(term)
+      );
+
+      if (foundLive) {
+          setSelectedTrain(foundLive);
+          setSelectedStation(null);
+          return;
+      }
+
+      // If not live, check ALL trips (scheduled)
+      // We need to construct a "Dummy" TrainPosition for viewing purposes
+      const foundTrip = Array.from(gtfsData.trips.values()).find((t: Trip) => 
+          t.trip_short_name?.toLowerCase().includes(term) ||
+          t.trip_headsign.toLowerCase().includes(term)
+      );
+
+      if (foundTrip) {
+          const times = gtfsData.stopTimes.get(foundTrip.trip_id);
+          const firstStop = times ? gtfsData.stops.get(times[0].stop_id) : null;
+          
+          if (firstStop) {
+              const staticPosition: TrainPosition = {
+                  trip_id: foundTrip.trip_id,
+                  lat: firstStop.stop_lat,
+                  lng: firstStop.stop_lon,
+                  bearing: 0,
+                  status: 'SCHEDULED', // New status for inactive
+                  route: gtfsData.routes.get(foundTrip.route_id),
+                  trip: foundTrip
+              };
+              setSelectedTrain(staticPosition);
+              setSelectedStation(null);
+          }
+          return;
+      }
+
+      // Not found
+      alert("No station or train found matching: " + searchTerm);
+  };
+
+  const handleCloseSelection = () => {
+      setSelectedTrain(null);
+      setSelectedStation(null);
+  };
+
+  // Drag & Drop
+  const onDragEnter = (e: React.DragEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      dragCounter.current += 1;
+      if (e.dataTransfer.items && e.dataTransfer.items.length > 0) setIsDragging(true);
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      dragCounter.current -= 1;
+      if (dragCounter.current === 0) setIsDragging(false);
+  };
+  const onDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); };
+  const onDrop = (e: React.DragEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      setIsDragging(false);
+      dragCounter.current = 0;
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          handleFile(e.dataTransfer.files[0]);
+          e.dataTransfer.clearData();
+      }
+  };
+
+  // --- Render ---
+
+  // 1. Loading
+  if (loading) {
+      return (
+          <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-50 space-y-4">
+              <Loader2 className="w-12 h-12 text-purple-600 animate-spin" />
+              <p className="text-slate-600 font-medium animate-pulse">{loadingMsg}</p>
+          </div>
+      );
   }
 
-  const activeTripIds: string[] = [];
-  gtfs.trips.forEach((trip) => {
-    if (activeServiceIds.has(trip.service_id)) {
-      activeTripIds.push(trip.trip_id);
-    }
-  });
+  // 2. Map View
+  if (gtfsData) {
+      const stopsList = Array.from(gtfsData.stops.values());
+      return (
+          <div className="relative h-screen w-screen overflow-hidden flex flex-col">
+              <Sidebar 
+                isOpen={isSidebarOpen}
+                setIsOpen={setIsSidebarOpen}
+                selectedTrain={selectedTrain} 
+                selectedStation={selectedStation}
+                searchTerm={searchTerm}
+                onSearchChange={setSearchTerm}
+                onSearchSubmit={handleSearch}
+                onCloseSelection={handleCloseSelection}
+                activeTrainsCount={positions.length}
+                currentTime={currentTimeStr}
+                gtfsData={gtfsData}
+              />
 
-  return activeTripIds;
-};
+              <div className="flex-1 w-full h-full">
+                  <TrainMap 
+                    positions={positions} 
+                    stops={stopsList} 
+                    selectedTrain={selectedTrain}
+                    selectedStation={selectedStation}
+                    onSelectTrain={(t) => {
+                        setSelectedTrain(t);
+                        setSelectedStation(null);
+                        setIsSidebarOpen(true);
+                    }}
+                    onSelectStation={(s) => {
+                        setSelectedStation(s);
+                        setSelectedTrain(null);
+                        setIsSidebarOpen(true);
+                    }}
+                  />
+              </div>
 
-// Re-export interface
-export { ExtendedGTFSData };
+              {/* No Trains Warning Overlay (only if not searching/inspecting static stuff) */}
+              {positions.length === 0 && !selectedTrain && !selectedStation && (
+                  <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-[1000] bg-white/90 backdrop-blur px-6 py-4 rounded-xl shadow-xl border border-yellow-200 flex items-center gap-3 max-w-md pointer-events-none">
+                      <AlertTriangle className="text-yellow-500 shrink-0" />
+                      <div className="text-sm text-slate-700">
+                          <p className="font-bold">No active trains found right now.</p>
+                          <p>It might be night time in Spain ({currentTimeStr}). Use search to find scheduled trains.</p>
+                      </div>
+                  </div>
+              )}
+          </div>
+      );
+  }
+
+  // 3. Initial Upload/Load
+  return (
+    <div 
+        className="h-screen w-screen bg-slate-50 flex flex-col items-center justify-center p-6"
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+    >
+      <div className={`
+        relative max-w-2xl w-full bg-white rounded-3xl shadow-xl border-2 transition-all duration-300 p-12 text-center
+        ${isDragging ? 'border-purple-500 bg-purple-50 scale-105' : 'border-dashed border-slate-300'}
+      `}>
+        {isDragging && (
+             <div className="absolute inset-0 bg-purple-100/80 backdrop-blur-sm z-10 rounded-3xl flex items-center justify-center">
+                 <p className="text-2xl font-bold text-purple-700">Drop GTFS Zip Here</p>
+             </div>
+        )}
+
+        <div className="mb-8 flex justify-center">
+            <div className="w-20 h-20 bg-purple-100 rounded-full flex items-center justify-center">
+                <Train className="w-10 h-10 text-purple-600" />
+            </div>
+        </div>
+
+        <h1 className="text-4xl font-bold text-slate-800 mb-4">Renfe AV/LD Tracker</h1>
+        <p className="text-slate-600 text-lg mb-8 max-w-lg mx-auto">
+            Real-time visualization of Spain's high-speed rail network.
+        </p>
+
+        {error && (
+            <div className="mb-6 p-4 bg-red-50 text-red-600 rounded-xl flex items-center justify-center gap-2 text-sm text-left">
+                <AlertTriangle size={20} className="shrink-0" />
+                <span>{error}</span>
+            </div>
+        )}
+
+        <div className="grid md:grid-cols-2 gap-4 w-full">
+            {/* Option A: Direct Load */}
+            <button 
+                onClick={handleFetchUrl}
+                className="flex flex-col items-center justify-center gap-3 p-6 rounded-xl bg-purple-600 text-white hover:bg-purple-700 transition-all shadow-lg hover:shadow-purple-500/25 group"
+            >
+                <Download size={32} className="group-hover:scale-110 transition-transform" />
+                <div className="text-left">
+                    <span className="block font-bold text-lg">Auto Load Data</span>
+                    <span className="text-purple-200 text-sm">Fetch directly from Renfe</span>
+                </div>
+            </button>
+
+            {/* Option B: Manual Upload */}
+            <label className="cursor-pointer flex flex-col items-center justify-center gap-3 p-6 rounded-xl bg-white border-2 border-slate-200 text-slate-600 hover:border-purple-300 hover:bg-slate-50 transition-all group">
+                <Upload size={32} className="text-slate-400 group-hover:text-purple-500 transition-colors" />
+                <div className="text-left">
+                    <span className="block font-bold text-lg text-slate-800">Upload ZIP</span>
+                    <span className="text-slate-400 text-sm">If you have the file</span>
+                </div>
+                <input 
+                    type="file" 
+                    accept=".zip" 
+                    className="hidden" 
+                    onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
+                />
+            </label>
+        </div>
+
+        <div className="mt-8 text-xs text-slate-400">
+            <p>Data Source: <a href={RENFE_GTFS_URL} className="underline hover:text-purple-500">Renfe Open Data</a></p>
+            <p className="mt-1 opacity-60">This app runs entirely in your browser.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
